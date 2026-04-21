@@ -1,110 +1,52 @@
-import asyncio
-import json
-import websockets
 import os
+import asyncio
+import websockets
+import json
 
-# Słownik przechowujący aktywne połączenia: { "Kamil#a8f2": <websocket> }
-connected_users = {}
+# Uniwersalny magazyn pokoi
+rooms = {}
 
-
-async def handle_client(websocket):
-    user_id = None
+async def universal_handler(websocket, path=None):
+    current_room = None
     try:
         async for message in websocket:
-            data = json.loads(message)
+            try:
+                data = json.loads(message)
+            except:
+                continue
+
             action = data.get("action")
+            room_id = str(data.get("room_id")) # Ujednolicamy ID jako tekst
 
-            # 1. Rejestracja użytkownika w sieci
-            if action == "register":
-                user_id = data.get("id")
-                if user_id:
-                    connected_users[user_id] = websocket
-                    print(f"[+] Zarejestrowano użytkownika: {user_id}")
-                    await websocket.send(
-                        json.dumps({"status": "registered", "id": user_id})
-                    )
+            if action == "join":
+                current_room = room_id
+                if room_id not in rooms:
+                    rooms[room_id] = set()
+                rooms[room_id].add(websocket)
+                print(f"Zalogowano do pokoju: {room_id}. Osób w środku: {len(rooms[room_id])}")
 
-            # 2. Przekazywanie wiadomości WebRTC do konkretnego odbiorcy
-            elif action in ["offer", "answer", "ice_candidate"]:
-
-                # FIX #2 + #3 — odrzuć wiadomość jeśli nadawca nie jest zarejestrowany
-                if not user_id:
-                    print(f"[!] Odrzucono {action}: nadawca nie jest zarejestrowany.")
-                    await websocket.send(
-                        json.dumps(
-                            {
-                                "action": "error",
-                                "message": "Musisz się najpierw zarejestrować.",
-                            }
-                        )
-                    )
-                    continue
-
-                target_id = data.get("target")
-                data["sender"] = user_id  # bezpieczne — user_id gwarantowany powyżej
-
-                if target_id not in connected_users:
-                    print(f"[-] Odrzucono: Użytkownik {target_id} jest offline.")
-                    await websocket.send(
-                        json.dumps(
-                            {
-                                "action": "error",
-                                "message": f"Użytkownik {target_id} jest offline lub nie istnieje.",
-                            }
-                        )
-                    )
-                    continue
-
-                # FIX #4 — obsługa martwych gniazd przy przekazywaniu
-                try:
-                    print(f"[*] Przekazywanie {action} od {user_id} do {target_id}")
-                    await connected_users[target_id].send(json.dumps(data))
-                except websockets.exceptions.ConnectionClosed:
-                    # Stale połączenie — wyczyść i poinformuj nadawcę
-                    print(
-                        f"[-] Martwe gniazdo dla {target_id}, usuwam z rejestru."
-                    )
-                    del connected_users[target_id]
-                    await websocket.send(
-                        json.dumps(
-                            {
-                                "action": "error",
-                                "message": f"Użytkownik {target_id} rozłączył się.",
-                            }
-                        )
-                    )
+            elif action == "relay" or "type" in data: 
+                # Dodajemy obsługę różnych formatów (stary kod mógł mieć "type")
+                if current_room in rooms:
+                    targets = [ws for ws in rooms[current_room] if ws != websocket]
+                    if targets:
+                        # Rozsyłamy do wszystkich innych w pokoju
+                        await asyncio.gather(*[ws.send(message) for ws in targets])
 
     except websockets.exceptions.ConnectionClosed:
         pass
-    except json.JSONDecodeError:
-        print(f"[!] Odebrano nieprawidłowy JSON od {user_id or 'nieznanego klienta'}")
     finally:
-        # Sprzątanie po wyłączeniu aplikacji przez użytkownika
-        if user_id and user_id in connected_users:
-            del connected_users[user_id]
-            print(f"[-] Użytkownik rozłączony: {user_id}")
-
+        if current_room in rooms and websocket in rooms[current_room]:
+            rooms[current_room].remove(websocket)
+            if not rooms[current_room]:
+                del rooms[current_room]
 
 async def main():
-    # Pobieranie portu ze zmiennych środowiskowych (dla chmury) lub użycie domyślnego 8765
-    port = int(os.environ.get("PORT", 8765))
-
-    # FIX #1 — ping_interval wykrywa i usuwa martwe połączenia (ghost connections).
-    # Serwer wysyła ping co 20s; klient ma 10s na odpowiedź pong.
-    # Bez tego: klienci którzy crashują lub tracą sieć zostają w connected_users
-    # na zawsze, a kolejne oferty do nich cicho wysypują serwer.
-    async with websockets.serve(
-        handle_client,
-        "0.0.0.0",
-        port,
-        ping_interval=20,
-        ping_timeout=10,
-    ):
-        print(f"🚀 Serwer sygnalizacyjny wystartował na porcie {port}")
-        print(f"   Nasłuchuję na 0.0.0.0:{port}")
-        print(f"   Keepalive: ping co 20s, timeout 10s")
+    # Render sam przydzieli port, nie ustawiaj go na sztywno jako 9001
+    port = int(os.environ.get("PORT", 8080)) 
+    async with websockets.serve(universal_handler, "0.0.0.0", port):
+        print(f"Uniwersalny Relay startuje na porcie {port}")
         await asyncio.Future()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
